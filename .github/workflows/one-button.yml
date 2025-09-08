@@ -1,0 +1,231 @@
+name: One-Button Run (US/CA/AU English Trends)
+
+on:
+  workflow_dispatch:
+    inputs:
+      VIDEOS_PER_RUN:
+        description: 'عدد الفيديوهات في التشغيل (يفضل 12 كبداية، ويمكن حتى 100)'
+        required: false
+        default: '12'
+  schedule:
+    - cron: "0 * * * *" # اختياري: تشغيل كل ساعة
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # أدوات لعمل الفيديوهات بدون أصول خارجية
+      - name: Install ffmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-freefont-ttf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Init project folder
+        run: |
+          mkdir -p scripts out
+          npm init -y
+          npm i @supabase/supabase-js@2.45.4
+
+      - name: Create all-in-one script
+        run: |
+          cat > scripts/run.mjs << 'EOF'
+          import { createClient } from '@supabase/supabase-js';
+          import { execSync } from 'node:child_process';
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          // إعدادات من Secrets
+          const SUPABASE_URL = process.env.SUPABASE_URL;
+          const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+          const SHORTENER_BASE_URL = process.env.SHORTENER_BASE_URL || ''; // اختياري
+          const VIDEOS_PER_RUN = parseInt(process.env.VIDEOS_PER_RUN || '12', 10);
+
+          if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+            console.error('يرجى ضبط Secrets: SUPABASE_URL و SUPABASE_SERVICE_ROLE');
+            process.exit(1);
+          }
+
+          const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
+
+          // ترندات إنجليزية (US/CA/AU) — أمثلة جاهزة، ويمكنك لاحقاً استبدالها بمصدر API حينما ترغب
+          const seedTrends = [
+            { region: 'US', topic: 'Home workout hacks', category: 'fitness' },
+            { region: 'US', topic: 'AI productivity tips', category: 'productivity' },
+            { region: 'CA', topic: 'Meal prep for busy people', category: 'fitness' },
+            { region: 'CA', topic: 'Top 3 study focus tricks', category: 'productivity' },
+            { region: 'AU', topic: 'Quick morning routine', category: 'self-improvement' },
+            { region: 'AU', topic: 'New gadget you must try', category: 'tech' },
+            { region: 'US', topic: 'At-home cardio in 20s', category: 'fitness' },
+            { region: 'CA', topic: 'Declutter your desk fast', category: 'productivity' },
+            { region: 'AU', topic: 'Build better habits now', category: 'self-improvement' },
+            { region: 'US', topic: 'Top 3 Chrome extensions', category: 'tech' },
+          ];
+
+          const hooksFor = (topic) => [
+            `3 quick wins for ${topic}`,
+            `Tried ${topic}? Do this next`,
+            `${topic} in 30 seconds`
+          ];
+          const ctasFor = (offerName='the deal') => [
+            `Grab ${offerName} — link`,
+            `Limited deal — link`,
+            `Start now — link`
+          ];
+
+          // FFmpeg: توليد فيديو رأسي 9:16 بخلفية متدرجة بدون ملفات خارجية + نصوص
+          // سنستخدم drawtext بخط حرّ من النظام
+          const FONT = '/usr/share/fonts/truetype/freefont/FreeSans.ttf';
+
+          function sanitizeText(t) {
+            return t.replace(/:/g,'\\:').replace(/'/g, "\\\\'");
+          }
+
+          function renderVideo({ hook, cta, outFile }) {
+            const H = sanitizeText(hook);
+            const C = sanitizeText(cta);
+            // - استخدام مصدر فيديو اصطناعي color+gradients
+            // - مسار صوتي بسيط (ضوضاء هادئة) لتجنب الصمت
+            const cmd = `
+              ffmpeg -y \
+                -f lavfi -i "color=c=0x0b0b0b:s=1080x1920:r=30:d=20" \
+                -f lavfi -i "sine=f=220:b=4:d=20" \
+                -filter_complex "
+                  [0:v]format=yuv420p,geq=r='p(X,Y)':g='p(X,Y)':b='p(X,Y)'[v0];
+                  [v0]drawbox=x=0:y=0:w=iw:h=ih:color=black@0.15:t=fill[v1];
+                  [v1]drawtext=fontfile=${FONT}:text='${H}':fontcolor=white:fontsize=64:x=(w-tw)/2:y=h*0.18:box=1:boxcolor=black@0.45:boxborderw=20[v2];
+                  [v2]drawtext=fontfile=${FONT}:text='${C}':fontcolor=yellow:fontsize=48:x=(w-tw)/2:y=h*0.82:box=1:boxcolor=black@0.35:boxborderw=16[vout]
+                " \
+                -map "[vout]" -map 1:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -shortest "${outFile}"
+            `;
+            execSync(cmd, { stdio: 'inherit' });
+          }
+
+          async function ensureBucket() {
+            // يفترض أنك أنشأت bucket باسم media وجعلته public من لوحة Supabase
+            // هنا فقط نتأكد من إمكانية رفع ملف اختبار
+            const testKey = `healthcheck/.keep-${Date.now()}`;
+            const { error } = await supabase.storage.from('media').upload(testKey, new Blob(), { upsert: true });
+            if (error && !String(error.message).includes('Empty file')) {
+              console.warn('تحذير: تحقق من وجود حاوية media وكونها Public');
+            }
+          }
+
+          async function publicUrl(key) {
+            const { data } = supabase.storage.from('media').getPublicUrl(key);
+            return data.publicUrl;
+          }
+
+          async function shorten(url) {
+            if (!SHORTENER_BASE_URL) return url;
+            try {
+              const res = await fetch(`${SHORTENER_BASE_URL}/shorten`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ target: url })
+              });
+              const j = await res.json();
+              return j.short || url;
+            } catch (e) {
+              return url;
+            }
+          }
+
+          async function insertVideo({ title, caption, cta, mp4Url }) {
+            // يفترض وجود جدول videos أدناه
+            const { data, error } = await supabase
+              .from('videos')
+              .insert({
+                trend_id: null,
+                offer_id: null,
+                variant: 'A',
+                title, caption, cta,
+                srt_url: null,
+                mp4_url: mp4Url,
+                landing_url: null,
+                short_url: null,
+                status: 'rendered'
+              })
+              .select('*')
+              .single();
+            if (error) throw error;
+            return data;
+          }
+
+          async function main() {
+            await ensureBucket();
+
+            fs.mkdirSync('out', { recursive: true });
+
+            let produced = 0;
+            for (const t of seedTrends) {
+              if (produced >= VIDEOS_PER_RUN) break;
+
+              const hooks = hooksFor(t.topic);
+              const ctas = ctasFor('the offer');
+
+              // 3 نسخ لكل ترند (A/B/C) — سننتج منها بحسب الحد
+              for (let i = 0; i < 3 && produced < VIDEOS_PER_RUN; i++) {
+                const hook = hooks[i % hooks.length];
+                const cta = ctas[i % ctas.length];
+
+                const baseName = `${t.region}_${t.topic.toLowerCase().replace(/[^a-z0-9]+/g,'-')}_${i}`;
+                const outFile = path.join('out', `${baseName}.mp4`);
+
+                renderVideo({ hook, cta, outFile });
+
+                // رفع إلى Supabase Storage
+                const key = `videos/${path.basename(outFile)}`;
+                const buf = fs.readFileSync(outFile);
+                const { error: upErr } = await supabase.storage.from('media').upload(key, buf, {
+                  upsert: true, contentType: 'video/mp4'
+                });
+                if (upErr) { console.error(upErr); continue; }
+
+                const mp4Url = await publicUrl(key);
+
+                const title = `${hook} — ${t.topic}`;
+                const caption = `${hook} | ${t.topic} | US/CA/AU`;
+
+                const row = await insertVideo({ title, caption, cta, mp4Url });
+
+                // بناء رابط صفحة هبوط مبدئي (يمكنك لاحقاً ربطه بموقعك)
+                const landing = `https://example-landing.site/p/${row.id}`;
+                const short = await shorten(landing);
+
+                await supabase.from('videos').update({
+                  landing_url: landing,
+                  short_url: short
+                }).eq('id', row.id);
+
+                produced++;
+              }
+            }
+
+            console.log(`تم إنتاج ${produced} فيديو ورفعها إلى Supabase Storage وتسجيلها في جدول videos.`);
+          }
+
+          main().catch(e => { console.error(e); process.exit(1); });
+          EOF
+
+      - name: Run one-button pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          SHORTENER_BASE_URL: ${{ secrets.SHORTENER_BASE_URL }}
+          VIDEOS_PER_RUN: ${{ github.event.inputs.VIDEOS_PER_RUN }}
+        run: node scripts/run.mjs
+
+      - name: Upload generated videos as artifact (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-videos
+          path: out/
